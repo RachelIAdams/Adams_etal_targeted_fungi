@@ -1,0 +1,450 @@
+---
+title: Targeted groups of fungi based on their moisture requirements for growth and
+  their abundances across homes with moisture damage
+author: "Rachel Adams"
+date: "2/11/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=70),tidy=TRUE)
+```
+
+## Motivation
+
+There is no quantifiable microbiological measurement that indicates building dampness. In this work, we hypothesized that particular groups of fungi, targeted based on the moisture requirements that they need to grow, are elevated in damaged buildings compared to dry buildings. This documents shows the methods used to isolate the fungi of interest from the entire fungal community and the statistical tests used to test the hypothesis. 
+
+This work was published in: Adams, R. I., Sylvain, I., Spilak, M. P., Taylor, J. W., Waring, M. S., & Mendell, M. J. (2020). Fungal signature of moisture damage in buildings: identification by targeted and untargeted approaches with mycobiome data. Applied and Environmental Microbiology, 86(17).
+
+## Preparation and input 
+
+### Load needed packages (not shown)
+
+```{r load packages, echo=FALSE}
+#load packages without warnings,messages
+suppressWarnings(suppressMessages(library(phyloseq)))
+suppressWarnings(suppressMessages(library(tidyr)))
+suppressWarnings(suppressMessages(library(dplyr)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library("pscl")))
+suppressWarnings(suppressMessages(library(lmtest)))
+suppressWarnings(suppressMessages(library(MASS)))
+suppressWarnings(suppressMessages(library(tibble)))
+suppressWarnings(suppressMessages(library(EnvStats)))
+suppressWarnings(suppressMessages(library(cowplot)))
+suppressWarnings(suppressMessages(library(stringr)))
+suppressWarnings(suppressMessages(library(reshape2)))
+suppressWarnings(suppressMessages(library(formatR)))
+
+```
+
+### Input data
+
+The starting input is a phyloseq object (https://joey711.github.io/phyloseq/index.html), which has three components: an OTU/ASV table, sample (meta)data, and taxonomic information.  
+
+```{r input ps data}
+setwd("~/Desktop/Targeted-fungi")
+ps=readRDS("~/Desktop/Targeted-fungi/data/ps.rds")
+ps
+```
+
+Many environmental samples were taken per home, but building damage was determined by the house. Later, we'll have to link the metadata associated with the sample with the building assessment recorded in another input table. 
+
+```{r input house data}
+house_meta = read.table("~/Desktop/Targeted-fungi/data/house_metadata.txt",header=TRUE)
+```
+
+The next input piece is the list of taxa that we want to target. In this case, it's a file of fungal species and their minimum moisture requirements for growth. Shown are the top five fungi in our list.
+
+```{r input target taxa data}
+target.aw=read.csv("~/Desktop/Targeted-fungi/data/moist_req_fungi.csv",header=TRUE)
+#dim(target.aw)
+head(target.aw)
+```
+
+We group the fungi into groups based on their minimum growth requirements.  
+xerophiles: 0.65 < aw <= 0.80  
+mesophiles: 0.80 >= aw < 0.90  
+hydrophiles: aw >= 0.90  
+
+```{r fungi by moisture requirements}
+hydro_level = 0.90
+xero_level = 0.80
+
+target.hydro = target.aw[target.aw$mean_min_aw >= hydro_level,]
+target.meso = target.aw[target.aw$mean_min_aw >= xero_level & target.aw$mean_min_aw < hydro_level,]
+target.xero = target.aw[target.aw$mean_min_aw < xero_level,]
+```
+
+### Produce individual phyloseq objects with just the taxa of interest. 
+
+First, match up the formatting of the species names between the phyloseq object and the important list of taxa you care about. Then get different phyloseq objects of just the taxa that you care about.  
+
+```{r new phyloseq objects}
+# create data frame to work with, in order to get taxonomic identity in Genus_species format
+# gs=as.data.frame(tax_table(ps)[,6:7]) #this is a slow step, so inporting previously-saved object
+# saveRDS(gs,"~/Desktop/Targeted-fungi/data/genus_species.RDS")
+gs=readRDS("~/Desktop/Targeted-fungi/data/genus_species.RDS")
+
+# create new column drawing on the existing columns and put in correct Genus_species format
+gs[,"Genus_species"]=paste(substring(gs$Genus,4,),"_",gsub("s__","\\1",gs$Species),sep="") 
+
+# get subsetted data frame of those ASVs that are hydrophiles
+gs.target.hydro=gs[(gs[,"Genus_species"] %in% target.hydro$taxa),] 
+# get new phyloseq table with just hydrophiles
+ps.target.hydro=prune_taxa(as.vector(rownames(gs.target.hydro)),ps); ps.target.hydro 
+
+#get subsetted data frame of those ASVs that are mesophiles
+gs.target.meso=gs[(gs[,"Genus_species"] %in% target.meso$taxa),] 
+#get new phyloseq table with just mesophiles
+ps.target.meso=prune_taxa(as.vector(rownames(gs.target.meso)),ps); ps.target.meso 
+
+#get subsetted data frame of those ASVs that are xerophiles
+gs.target.xero=gs[(gs[,"Genus_species"] %in% target.xero$taxa),] 
+#get new phyloseq table with just xerophiles
+ps.target.xero=prune_taxa(as.vector(rownames(gs.target.xero)),ps); ps.target.xero 
+```
+
+Checking out the abundances of the different groups across the samples. There are more mesophiles observed in the community, by a lot. 
+
+```{r sample sums across groups objects, fig.height=3, fig.width=4}
+sampsums_groups = melt(bind_cols(sample_name=sample_names(ps.target.hydro),
+                              hydro=sample_sums(ps.target.hydro),
+                              meso=sample_sums(ps.target.meso),
+                              xero=sample_sums(ps.target.xero)),
+                       id.vars = "sample_name") 
+ggplot(sampsums_groups, aes(x=variable, y=value)) + 
+  geom_boxplot(notch=TRUE)
+ggsave("~/Desktop/Targeted-fungi/outputs/counts_of_fungal_groups_across_samples.pdf", width = 4, height = 3, units = "in", dpi=600)
+```
+
+### Combine house-level metadata with individual samples in phyloseq objects 
+
+For this dataset, building damage was assessed at the home level. Many individual samples were taken per home and using different sampling methods. In this step, we both (1) subset the whole community table (phyloseq) objects into different sampling types and time points (so we are comparing apples to apples) and (2) add the corresponding home-level metadata recorded in a separate table. 
+
+Make decisions about damage category cutoffs 
+```{r home-level metadata}
+
+#some homes were only samples in one season, and these need to be excluded 
+summer_units_only = c("H62", "H63", "H64", "H65", "H66", "H67", "H68", "H69", "H70", "H71")
+
+### decisions about categories 
+mold_size_cutoff = 20 #size of mold damage in square feet
+damaze_size_cutoff = 20 #size of all damage in square feet
+mmr_value = 15 #moisutre meeting reading values 
+```
+
+
+Generate different phyloseq objects that are based on the same sample type, within the same season, and have the specific fungal groups of interest
+
+```{r create units for analysis}
+sample_type = factor(c("DC","vacuum")) #Dustfall collectors and vaccum samples
+season = factor(c("winter", "summer"))
+type = factor(c("hydro", "meso", "xero"))
+
+for (i in levels(season)) {
+  for (j in levels(sample_type)) {
+    for (k in levels(type)) {
+      #print(paste(i,j,k, sep="."))
+      str = paste0('ps.object = subset_samples(ps.target.',k,', 
+                   season=="',i,'" & 
+                   sample_type =="', j,'" & 
+                   indoor_outdoor =="indoor" & 
+                   !houseID %in% summer_units_only)')
+        #print(str)
+        eval(parse(text = str))
+
+        #create a dataframe of the relevant samples which be used to add on metadata
+        sd <- as(sample_data(ps.object), "data.frame")
+        sd$mold_size_in_unit <- NA
+        sd$mold_size_in_unit_cat <- NA
+        sd$mold_dam_in_unit <- NA
+        sd$num_discrete_mold_areas <- NA
+        sd$num_discrete_mold_areas_cat <- NA
+        sd$other_dam_size_in_unit <- NA
+        sd$other_dam_in_unit <- NA
+        sd$total_dam_in_unit <- NA
+        sd$total_dam_size_in_unit <- NA
+        sd$total_dam_size_in_unit_cat <- NA
+        sd$num_damage_areas <- NA
+        sd$num_discrete_dam_areas_cat <- NA
+        sd$num_mmr <- NA
+        sd$num_mmr_cat <- NA
+        sd$num_mmr_cat_binary <- NA
+        sd$mmr_avg <- NA
+        sd$mmr_avg_cat <- NA
+        sd$window_condensation_original <- NA
+        sd$window_condensation <- NA
+        sd$dam_index_value <- NA
+        sd$dam_index <- NA
+        moist <- house_meta %>% dplyr::select(starts_with("Moist"))
+        moist$new <- rowSums(moist >= mmr_value, na.rm = TRUE) * NA ^ (rowSums(!is.na(moist)) == 0)
+        moist$avg <- rowMeans(moist[,1:4],na.rm = TRUE)
+
+        #look up houseID of the sample in the home-level metadata and add to "sd" dataframe 
+        for (m in 1:nrow(sd)) {
+          sd[m,"mold_size_in_unit"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("mold_size")]),house_meta[paste(sd[m,"houseID"]),paste0("mold_size")],"NA")
+          sd[m,"num_discrete_mold_areas"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("num_discrete_mold_areas")]),house_meta[paste(sd[m,"houseID"]),paste0("num_discrete_mold_areas")],"NA")
+          sd[m,"other_dam_size_in_unit"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("other_damage_size")]),house_meta[paste(sd[m,"houseID"]),paste0("other_damage_size")],"NA")
+          sd[m,"total_dam_size_in_unit"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("total_damage_size")]),house_meta[paste(sd[m,"houseID"]),paste0("total_damage_size")],"NA")
+          sd[m,"num_damage_areas"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("num_discrete_total_damage_areas")]),house_meta[paste(sd[m,"houseID"]),paste0("num_discrete_total_damage_areas")],"NA")
+          sd[m,"num_mmr"] <- moist[paste(sd[m,"houseID"]),paste("new")]
+          sd[m,"mmr_avg"] <- moist[paste(sd[m,"houseID"]),paste("avg")]
+          sd[m,"window_condensation_original"] <- ifelse(!is.null(house_meta[paste(sd[m,"houseID"]),paste0("wind_condensation")]),house_meta[paste(sd[m,"houseID"]),paste0("wind_condensation")],"NA")
+        }
+
+        sd$mold_size_in_unit_cat <- ifelse(is.na(sd$mold_size_in_unit),"NA",ifelse(sd$mold_size_in_unit==0,"0",ifelse(sd$mold_size_in_unit < mold_size_cutoff,"1","2")))
+        sd$mold_dam_in_unit <- ifelse(is.na(sd$mold_size_in_unit),"NA",ifelse(sd$mold_size_in_unit>0,"yes","no"))
+        sd$num_discrete_mold_areas_cat <- ifelse(is.na(sd$num_discrete_mold_areas),"NA",ifelse(sd$num_discrete_mold_areas>1,"2",sd$num_discrete_mold_areas))
+        sd$other_dam_in_unit <- ifelse(is.na(sd$other_dam_size_in_unit),"NA",ifelse(sd$other_dam_size_in_unit>0,"yes","no"))
+        sd$total_dam_in_unit <- ifelse(is.na(sd$total_dam_size_in_unit),"NA",ifelse(sd$total_dam_size_in_unit>0,"yes","no"))
+        sd$total_dam_size_in_unit_cat <- ifelse(is.na(sd$total_dam_size_in_unit),"NA",ifelse(sd$total_dam_size_in_unit==0,"0",ifelse(sd$total_dam_size_in_unit < damaze_size_cutoff,"mid","high")))
+        sd$num_discrete_dam_areas_cat <- ifelse(is.na(sd$num_damage_areas),"NA",ifelse(sd$num_damage_areas>1,"2+",sd$num_damage_areas))
+        sd$num_mmr_cat <- ifelse(is.na(sd$num_mmr),"NA",ifelse(sd$num_mmr>1,"2+",sd$num_mmr))
+        sd$num_mmr_cat_binary <- ifelse(is.na(sd$num_mmr),"NA",ifelse(sd$num_mmr>0,"1","0"))
+        sd$mmr_avg_cat <- ifelse(is.na(sd$mmr_avg),"NA",ifelse(sd$mmr_avg<12,"Less_than_12",ifelse(sd$mmr_avg>15,"Greater_than_15","Between_12_and_15")))
+        sd$window_condensation <- ifelse(is.na(sd$window_condensation_original),"NA",ifelse(sd$window_condensation_original==2,"1","0"))
+        suppressWarnings({sd$dam_index_value <- as.integer(sd$mold_size_in_unit_cat) + as.integer(sd$num_discrete_mold_areas_cat) + as.integer(sd$window_condensation) + as.integer(sd$num_mmr_cat_binary) })
+        #sd$dam_index_value <- as.integer(sd$mold_size_in_unit_cat) + as.integer(sd$num_discrete_mold_areas_cat) + as.integer(sd$window_condensation) + as.integer(sd$num_mmr_cat_binary)
+        sd$dam_index <- ifelse(sd$dam_index_value==0,0,ifelse(sd$dam_index_value==1|sd$dam_index_value==2,1,2)) #note this replaces NA with 2
+
+        #make sure order of dataframes are the same then add metadata to phyloseq object 
+        identical(rownames(sd),rownames(sample_data(ps.object))) 
+        sample_data(ps.object)$mold_size_in_unit <- sd$mold_size_in_unit
+        sample_data(ps.object)$mold_size_in_unit_cat <- sd$mold_size_in_unit_cat
+        sample_data(ps.object)$mold_dam_in_unit <- sd$mold_dam_in_unit
+        sample_data(ps.object)$num_discrete_mold_areas <- sd$num_discrete_mold_areas
+        sample_data(ps.object)$num_discrete_mold_areas_cat <- sd$num_discrete_mold_areas_cat
+        sample_data(ps.object)$other_dam_size_in_unit <- sd$other_dam_size_in_unit
+        sample_data(ps.object)$other_dam_in_unit <- sd$other_dam_in_unit
+        sample_data(ps.object)$total_dam_in_unit <- sd$total_dam_in_unit
+        sample_data(ps.object)$total_dam_size_in_unit <- sd$total_dam_size_in_unit
+        sample_data(ps.object)$total_dam_size_in_unit_cat <- sd$total_dam_size_in_unit_cat
+        sample_data(ps.object)$num_damage_areas <- sd$num_damage_areas
+        sample_data(ps.object)$num_discrete_dam_areas_cat <- sd$num_discrete_dam_areas_cat
+        sample_data(ps.object)$num_mmr <- sd$num_mmr
+        sample_data(ps.object)$num_mmr_cat <- sd$num_mmr_cat
+        sample_data(ps.object)$num_mmr_cat_binary <- sd$num_mmr_cat_binary
+        sample_data(ps.object)$mmr_avg <- sd$mmr_avg
+        sample_data(ps.object)$mmr_avg_cat <- sd$mmr_avg_cat
+        sample_data(ps.object)$window_condensation_original <- sd$window_condensation_original
+        sample_data(ps.object)$window_condensation <- sd$window_condensation
+        sample_data(ps.object)$dam_index_value <- sd$dam_index_value
+        sample_data(ps.object)$dam_index <- sd$dam_index
+        sample_data(ps.object)$name = sample_names(ps.object)
+        sample_data(ps.object)$Y = sample_sums(ps.object)
+        sample_data(ps.object)$nReads = sample_sums(ps)[sample_names(ps.object)]
+        sample_data(ps.object)$Y.ra = sample_data(ps.object)$Y/sample_data(ps.object)$nReads
+        
+        #save subsetted phyloseq object updated with appropriate metadata 
+        str1 = paste0('saveRDS(ps.object,"~/Desktop/Targeted-fungi/processed_data/',i,'.',j,'.',k,'.ps.RDS")')
+        eval(parse(text = str1))
+    }
+  }
+}
+```
+
+### Run negative-binomial models on the observed distributions to determine in groups of fungi are more abundant in damaged buildings
+
+```{r negative binomial prep, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+#list of phyloseq objects 
+tabs=c("~/Desktop/Targeted-fungi/processed_data/winter.vacuum.hydro.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/winter.DC.hydro.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/winter.vacuum.meso.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/winter.DC.meso.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/winter.vacuum.xero.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/winter.DC.xero.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.vacuum.hydro.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.DC.hydro.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.vacuum.meso.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.DC.meso.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.vacuum.xero.ps.RDS",
+       "~/Desktop/Targeted-fungi/processed_data/summer.DC.xero.ps.RDS")
+
+#the final list of damange variables we will test fungal communities against 
+dam.names = c("mold_dam_in_unit",
+              "num_discrete_mold_areas_cat",
+              "mold_size_in_unit_cat",
+              "dam_index",
+              "total_dam_in_unit",
+              "num_discrete_dam_areas_cat",
+              "total_dam_size_in_unit_cat", 
+              "num_mmr_cat_binary")
+
+#empty data frame summarazing some description features of the data
+df1 <- data.frame(object_name = character(),
+                  n_taxa = integer(),
+                  min_sample_sums = integer(),
+                  max_sample_sums = integer(),
+                  mean_sample_sums = double(),
+                  median_sample_sums = double(),stringsAsFactors = FALSE)
+
+#empty list that will get filled with model results 
+house_list = list()
+```
+
+Now, we take each phyloseq object, that has the targeted fungal communities of a particular sample type, within a particular season, and run negative binomial models. 
+
+```{r negative binomial model}
+
+# Suppress summarise info
+options(dplyr.summarise.inform = FALSE)
+
+for (o in 1:length(tabs)) {
+  ps.object = readRDS(tabs[o]) # load data.frame and save it to ps.objet 
+
+  #empty data frame that gets filled with model output 
+  df <- data.frame(object_name = character(),
+                   category = character(),
+                   no_0_num = integer(),
+                   yes_1_num = integer(),
+                   yes_2_num = integer(),
+                   ArithMeans = character(),
+                   EstRelChange1 = integer(),
+                   conf.int1 = character(),
+                   EstRelChange2 = integer(),
+                   conf.int2 = character(),                
+                   model_p = numeric(), 
+                   stringsAsFactors = FALSE) 
+  
+  mdf = psmelt(ps.object)
+  
+  #getting the data in the correct format for running the model 
+  dat1.pre = cbind.data.frame(name=sample_data(ps.object)$name, 
+                              Y=sample_data(ps.object)$Y, nReads=sample_data(ps.object)$nReads,
+                              Y.ra=sample_data(ps.object)$Y.ra,
+                              mold_dam_in_unit=sample_data(ps.object)$mold_dam_in_unit,    
+                              num_discrete_mold_areas_cat = sample_data(ps.object)$num_discrete_mold_areas_cat,
+                              mold_size_in_unit_cat = sample_data(ps.object)$mold_size_in_unit_cat,
+                              dam_index = as.factor(sample_data(ps.object)$dam_index),
+                              total_dam_in_unit = sample_data(ps.object)$total_dam_in_unit,
+                              num_discrete_dam_areas_cat = sample_data(ps.object)$num_discrete_dam_areas_cat,
+                              total_dam_size_in_unit_cat = sample_data(ps.object)$total_dam_size_in_unit_cat,
+                              num_mmr_cat_binary = sample_data(ps.object)$num_mmr_cat_binary)
+  dat1.pre$total_dam_size_in_unit_cat = factor(dat1.pre$total_dam_size_in_unit_cat, levels = c("0", "mid", "high"))
+  dat1.pre$num_mmr_cat_binary[dat1.pre$num_mmr_cat_binary=="NA"] <- NA
+  dat1.pre = add_column(dat1.pre, Offset = log(dat1.pre$nReads), .after = "Y.ra")
+  dat1 = dat1.pre[dat1.pre$nReads>1000,]
+  
+  #excluding an hydro sample that's nearly entirely Rhodotorula mucilaginosa  
+  dat1 = dat1[dat1$Y.ra<0.6,]
+  
+  #filling in the description features of the data
+  object.vector = c(tabs[o],
+                    nrow(unique(mdf[c("Genus", "Species")])),
+                    round(min(dat1$Y.ra),2),
+                    round(max(dat1$Y.ra),2),
+                    round(mean(dat1$Y.ra),2),
+                    round(median(dat1$Y.ra),2))
+  
+  df1[o,] = object.vector
+  
+  # run the negative binomial model for each of the damage variables 
+  for (p in 1:length(dam.names)){
+    gp = group_by_at(dat1, dam.names[p]) %>%
+      summarise(
+        count = n(),
+        mean = mean(Y.ra, na.rm = TRUE),
+        median = median(Y.ra, na.rm = TRUE))  %>%
+      filter((!!as.symbol(dam.names[p])) != "NA")
+ 
+    #this is the main model; its offset by the total sequence count in each sample 
+    str1 = paste0("modelnb = glm.nb(Y ~ ",dam.names[p],"+ offset(Offset), data = subset(dat1, !is.na(",dam.names[p],")))")
+    eval(parse(text = str1))
+  
+    #this is the "null" model which doesn't have the damage variables
+    str2 = paste0("m2 = update(modelnb, . ~ . -",dam.names[p],")")
+    eval(parse(text = str2))
+    
+    #a good approach, according to: https://twitter.com/WeAreRLadies/status/1223805169650950144 for getting significance of a model 
+    an = anova(modelnb,m2) 
+    
+    ci = suppressMessages(confint(modelnb))
+      
+    #fill in model results in a summarized format that is easy to read 
+    df[p,1] = tabs[o]
+    df[p,2] = dam.names[p]
+    df[p,3] = gp[1,2] 
+    df[p,4] = gp[2,2]  
+    if (nrow(gp) == 2) {
+      df[p,6] = paste0(sprintf('%.3f',gp[1,3]),", ",sprintf('%.3f',gp[2,3]))
+      df[p,7] = exp(modelnb$coefficients[2])
+      df[p,8] = paste0(round(exp(ci[2,1]),2),", ",round(exp(ci[2,2]),2))
+      df[p,11] = round(summary(modelnb)$coefficients[,4][2],2)
+    } else {
+      df[p,5] = gp[3,2]  
+      df[p,6] = paste0(sprintf('%.3f',gp[1,3]),", ",sprintf('%.3f',gp[2,3]),", ",sprintf('%.3f',gp[3,3]))
+      df[p,7] = exp(modelnb$coefficients[2])
+      df[p,8] = paste0(round(exp(ci[2,1]),2),", ",round(exp(ci[2,2]),2))
+      df[p,9] = exp(modelnb$coefficients[3])
+      df[p,10] = paste0(round(exp(ci[3,1]),2),", ",round(exp(ci[3,2]),2))
+      df[p,11] = round(an$`Pr(Chi)`[2],2)
+    }
+  }
+  #fill in model results in a list
+  house_list[[o]] <- df  
+}
+
+#write input summary results to a txt file 
+write.table(df1, '~/Desktop/Targeted-fungi/outputs/nb_model_input_summary.txt', sep = "\t",row.names = FALSE, col.names = TRUE)
+
+#combine all the entries of the list and write that to a .csv file
+house_list_all = do.call(rbind, house_list)
+write.csv(house_list_all,"~/Desktop/Targeted-fungi/outputs/neg_bin_output.csv")
+```
+
+
+While the output is mainly in the table just generated, you can also visualize the observed distributions to see the magnitude of the effect. 
+```{r plot of nb reslts,fig.height=3, fig.width=6}
+tabs=c("~/Desktop/Targeted-fungi/processed_data/winter.vacuum.hydro.ps.RDS") #whichever phyloseq object you want to look
+ps.object = readRDS(tabs[1])
+dat1.pre = cbind.data.frame(name=sample_data(ps.object)$name,
+                            Y=sample_data(ps.object)$Y,
+                            nReads=sample_data(ps.object)$nReads,
+                            Y.ra=sample_data(ps.object)$Y.ra,
+                            mold_dam_in_unit=sample_data(ps.object)$mold_dam_in_unit,    
+                            num_discrete_mold_areas_cat = sample_data(ps.object)$num_discrete_mold_areas_cat,
+                            mold_size_in_unit_cat = sample_data(ps.object)$mold_size_in_unit_cat,
+                            dam_index = as.factor(sample_data(ps.object)$dam_index),
+                            total_dam_in_unit = sample_data(ps.object)$total_dam_in_unit,
+                            num_discrete_dam_areas_cat = sample_data(ps.object)$num_discrete_dam_areas_cat,
+                            total_dam_size_in_unit_cat = sample_data(ps.object)$total_dam_size_in_unit_cat,
+                            num_mmr_cat_binary = sample_data(ps.object)$num_mmr_cat_binary)
+dat1.pre$total_dam_size_in_unit_cat = factor(dat1.pre$total_dam_size_in_unit_cat, levels = c("0", "mid", "high"))
+dat1.pre$num_mmr_cat_binary[dat1.pre$num_mmr_cat_binary=="NA"] <- NA
+dat1.pre = add_column(dat1.pre, Offset = log(dat1.pre$nReads), .after = "Y.ra")
+dat1 = dat1.pre[dat1.pre$nReads>1000,]
+#excluding the hydro sample dominated by Rhodotorula mucilaginosa  
+dat1 = dat1[dat1$Y.ra<0.6,]
+
+a = ggplot(data=dat1, aes(x=mold_dam_in_unit, y=Y.ra)) + 
+  geom_jitter(width = 0.10,color = "gray75",size=2) + 
+  theme_light() + theme(panel.grid.minor = element_blank(),panel.grid.major = element_blank(), axis.title.x = element_text(size = 9)) + 
+  stat_summary(fun=mean, geom="point", shape=16,size=3, color="black") +
+  xlab("Mold damage in unit") + ylab("Relative abundance of hydrophilic fungi") + 
+  scale_x_discrete(breaks=c("no","yes"),labels=c("No", "Yes"))
+
+b = ggplot(data=dat1, aes(x=num_discrete_mold_areas_cat, y=Y.ra)) + 
+  geom_jitter(width = 0.10,color = "gray75",size=2) + 
+  theme_light() + theme(panel.grid.minor = element_blank(),panel.grid.major = element_blank(), axis.title.x = element_text(size = 9)) + 
+  stat_summary(fun=mean, geom="point", shape=16,size=3, color="black") +
+  xlab("Number of mold damage areas") + ylab("") + 
+  scale_x_discrete(breaks=c("0","1","2"),labels=c("0", "1", "2+"))
+
+c = ggplot(data=dat1, aes(x=mold_size_in_unit_cat, y=Y.ra)) + 
+  geom_jitter(width = 0.10,color = "gray75",size=2) + 
+  theme_light() + theme(panel.grid.minor = element_blank(),panel.grid.major = element_blank(), axis.title.x = element_text(size = 9)) + 
+  stat_summary(fun=mean, geom="point", shape=16,size=3, color="black") +
+  xlab("Total size of mold area") + ylab("") + 
+  scale_x_discrete(breaks=c("0","1","2"),labels=c("None", "Mid", "High"))
+
+plot_grid(a, b, c,
+          ncol = 3, nrow = 1) 
+
+ggsave("~/Desktop/Targeted-fungi/outputs/hydro-vacuum-high_res.pdf", width = 7, height = 3.5, units = "in", dpi=600)
+```
+
+
